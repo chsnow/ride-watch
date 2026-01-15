@@ -2,14 +2,9 @@ import express from 'express';
 import { Firestore } from '@google-cloud/firestore';
 import { CloudTasksClient } from '@google-cloud/tasks';
 import admin from 'firebase-admin';
-import twilio from 'twilio';
 
 // Configuration from environment variables
 const config = {
-  twilioSid: process.env.TWILIO_SID,
-  twilioToken: process.env.TWILIO_TOKEN,
-  twilioNumber: process.env.TWILIO_NUMBER,
-  recipientNumbers: (process.env.RECIPIENT_NUMBERS || '').split(',').filter(Boolean),
   parkIds: (process.env.PARK_IDS || '').split(',').filter(Boolean),
   watchedRides: (process.env.WATCHED_RIDES || '').split(',').filter(Boolean),
   port: parseInt(process.env.PORT || '8080', 10),
@@ -23,8 +18,6 @@ const config = {
   alertIntervalSec: parseInt(process.env.ALERT_INTERVAL_SEC || '60', 10),
   // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
-  enableSms: process.env.ENABLE_SMS !== 'false', // Default true
-  enablePush: process.env.ENABLE_PUSH !== 'false', // Default true
 };
 
 // Initialize Firebase Admin (uses Application Default Credentials in Cloud Run)
@@ -46,11 +39,6 @@ const devicesCollection = firestore.collection('devices');
 
 // Initialize Cloud Tasks client
 const tasksClient = new CloudTasksClient();
-
-// Initialize Twilio client
-const twilioClient = config.twilioSid && config.twilioToken
-  ? twilio(config.twilioSid, config.twilioToken)
-  : null;
 
 // ThemeParks Wiki API base URL
 const API_BASE = 'https://api.themeparks.wiki/v1';
@@ -147,11 +135,6 @@ async function sendPushNotification(title, body, data = {}) {
     return { sent: 0, failed: 0 };
   }
 
-  if (!config.enablePush) {
-    console.log('Push notifications disabled');
-    return { sent: 0, failed: 0 };
-  }
-
   const devices = await getDeviceTokens();
   if (devices.length === 0) {
     console.log('No registered devices for push notifications');
@@ -163,7 +146,6 @@ async function sendPushNotification(title, body, data = {}) {
   let sent = 0;
   let failed = 0;
 
-  // Send to each device individually to handle errors per-device
   for (const device of devices) {
     try {
       const message = {
@@ -193,7 +175,6 @@ async function sendPushNotification(title, body, data = {}) {
       failed++;
       console.error(`Failed to send push to ${device.token.slice(0, 20)}...:`, error.message);
 
-      // Mark invalid tokens for cleanup
       if (
         error.code === 'messaging/invalid-registration-token' ||
         error.code === 'messaging/registration-token-not-registered'
@@ -205,67 +186,6 @@ async function sendPushNotification(title, body, data = {}) {
   }
 
   return { sent, failed };
-}
-
-/**
- * Send SMS notification via Twilio
- */
-async function sendSmsNotification(message) {
-  if (!twilioClient) {
-    console.warn('Twilio not configured, skipping SMS notification');
-    return { sent: 0, failed: 0 };
-  }
-
-  if (!config.enableSms) {
-    console.log('SMS notifications disabled');
-    return { sent: 0, failed: 0 };
-  }
-
-  if (config.recipientNumbers.length === 0) {
-    console.warn('No recipient numbers configured');
-    return { sent: 0, failed: 0 };
-  }
-
-  console.log(`Sending SMS to ${config.recipientNumbers.length} recipient(s)`);
-
-  let sent = 0;
-  let failed = 0;
-
-  const sendPromises = config.recipientNumbers.map(async (to) => {
-    try {
-      await twilioClient.messages.create({
-        body: message,
-        from: config.twilioNumber,
-        to: to.trim(),
-      });
-      sent++;
-      console.log(`SMS sent to ${to}`);
-    } catch (error) {
-      failed++;
-      console.error(`Failed to send SMS to ${to}:`, error.message);
-    }
-  });
-
-  await Promise.all(sendPromises);
-  return { sent, failed };
-}
-
-/**
- * Send notification via all configured channels (SMS + Push)
- */
-async function sendNotification(title, body, data = {}) {
-  const results = {
-    sms: { sent: 0, failed: 0 },
-    push: { sent: 0, failed: 0 },
-  };
-
-  // Send SMS (body only, no title)
-  results.sms = await sendSmsNotification(body);
-
-  // Send push notification
-  results.push = await sendPushNotification(title, body, data);
-
-  return results;
 }
 
 /**
@@ -291,7 +211,7 @@ function isDownStatus(status) {
  * Format status change message
  */
 function formatStatusMessage(rideName, oldStatus, newStatus) {
-  return `🎢 ${rideName}: ${oldStatus || 'Unknown'} → ${newStatus}`;
+  return `${rideName}: ${oldStatus || 'Unknown'} → ${newStatus}`;
 }
 
 /**
@@ -416,15 +336,14 @@ async function checkStatusChanges() {
     }
   }
 
-  // Send notifications for all status changes
+  // Send push notifications for status changes
   let notificationResults = null;
   if (statusChanges.length > 0) {
     if (statusChanges.length <= 3) {
-      // Send individual notifications for small number of changes
       for (const change of statusChanges) {
         const title = getNotificationTitle(change.newStatus);
         const body = formatStatusMessage(change.rideName, change.oldStatus, change.newStatus);
-        notificationResults = await sendNotification(title, body, {
+        notificationResults = await sendPushNotification(title, body, {
           rideId: change.rideId,
           rideName: change.rideName,
           oldStatus: change.oldStatus,
@@ -433,13 +352,12 @@ async function checkStatusChanges() {
         });
       }
     } else {
-      // Send a summary for many changes
       const messages = statusChanges.map(change =>
         `• ${change.rideName}: ${change.oldStatus} → ${change.newStatus}`
       );
       const title = `${statusChanges.length} Ride Status Changes`;
-      const body = `🎢 ${statusChanges.length} rides changed:\n${messages.join('\n')}`;
-      notificationResults = await sendNotification(title, body, {
+      const body = messages.join('\n');
+      notificationResults = await sendPushNotification(title, body, {
         type: 'status_change_summary',
         count: statusChanges.length.toString(),
       });
@@ -496,7 +414,7 @@ app.delete('/devices/:token', async (req, res) => {
   }
 });
 
-// List registered devices (for debugging)
+// List registered devices
 app.get('/devices', async (req, res) => {
   try {
     const devices = await getDeviceTokens();
@@ -641,9 +559,7 @@ app.get('/', (req, res) => {
     config: {
       parksMonitored: config.parkIds.length,
       watchedRides: config.watchedRides.length || 'all',
-      smsRecipients: config.recipientNumbers.length,
-      smsEnabled: config.enableSms && !!twilioClient,
-      pushEnabled: config.enablePush && firebaseInitialized,
+      pushEnabled: firebaseInitialized,
       dynamicScheduling: config.dynamicScheduling,
       normalIntervalSec: config.normalIntervalSec,
       alertIntervalSec: config.alertIntervalSec,
@@ -656,8 +572,7 @@ app.listen(config.port, () => {
   console.log(`ride-watch service listening on port ${config.port}`);
   console.log(`Monitoring ${config.parkIds.length} park(s)`);
   console.log(`Watching ${config.watchedRides.length || 'all'} ride(s)`);
-  console.log(`SMS: ${config.enableSms && twilioClient ? `enabled (${config.recipientNumbers.length} recipients)` : 'disabled'}`);
-  console.log(`Push: ${config.enablePush && firebaseInitialized ? 'enabled' : 'disabled'}`);
+  console.log(`Push notifications: ${firebaseInitialized ? 'enabled' : 'disabled'}`);
   console.log(`Dynamic scheduling: ${config.dynamicScheduling ? 'enabled' : 'disabled'}`);
   if (config.dynamicScheduling) {
     console.log(`  Normal interval: ${config.normalIntervalSec}s, Alert interval: ${config.alertIntervalSec}s`);
