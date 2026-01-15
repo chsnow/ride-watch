@@ -1,0 +1,24 @@
+{
+  "name": "ride-watch",
+  "version": "1.0.0",
+  "description": "Disney theme park attraction status monitor with SMS notifications",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "disney",
+    "theme-parks",
+    "monitoring",
+    "twilio",
+    "cloud-run"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/firestore": "^7.3.0",
+    "express": "^4.18.2",
+    "twilio": "^4.21.0"
+  }
+}
