@@ -10,6 +10,7 @@ A serverless service that monitors Disney theme park attraction status and sends
 - Persists state in Firestore between invocations
 - Filter to monitor only specific rides or all attractions
 - Supports multiple SMS recipients
+- **Dynamic scheduling**: Checks every 5 minutes normally, every 1 minute when any ride is down
 
 ## Prerequisites
 
@@ -102,6 +103,7 @@ gcloud services enable \
   run.googleapis.com \
   firestore.googleapis.com \
   cloudscheduler.googleapis.com \
+  cloudtasks.googleapis.com \
   cloudbuild.googleapis.com
 ```
 
@@ -112,10 +114,18 @@ gcloud services enable \
 gcloud firestore databases create --location=us-central1
 ```
 
-### 3. Deploy to Cloud Run
+### 3. Create Cloud Tasks queue (for dynamic scheduling)
 
 ```bash
-# Build and deploy
+# Create the queue
+gcloud tasks queues create ride-watch-queue --location=us-central1
+```
+
+### 4. Deploy to Cloud Run
+
+**Option A: Static scheduling (Cloud Scheduler only)**
+
+```bash
 gcloud run deploy ride-watch \
   --source . \
   --region us-central1 \
@@ -127,6 +137,36 @@ gcloud run deploy ride-watch \
   --set-env-vars "RECIPIENT_NUMBERS=+1234567890" \
   --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
   --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
+```
+
+**Option B: Dynamic scheduling (recommended)**
+
+```bash
+# First deploy to get the service URL
+gcloud run deploy ride-watch \
+  --source . \
+  --region us-central1 \
+  --platform managed \
+  --allow-unauthenticated \
+  --set-env-vars "DYNAMIC_SCHEDULING=true" \
+  --set-env-vars "CLOUD_TASKS_LOCATION=us-central1" \
+  --set-env-vars "CLOUD_TASKS_QUEUE=ride-watch-queue" \
+  --set-env-vars "NORMAL_INTERVAL_SEC=300" \
+  --set-env-vars "ALERT_INTERVAL_SEC=60" \
+  --set-env-vars "TWILIO_SID=your_sid" \
+  --set-env-vars "TWILIO_TOKEN=your_token" \
+  --set-env-vars "TWILIO_NUMBER=+1234567890" \
+  --set-env-vars "RECIPIENT_NUMBERS=+1234567890" \
+  --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
+  --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
+
+# Get the service URL
+SERVICE_URL=$(gcloud run services describe ride-watch --region us-central1 --format 'value(status.url)')
+
+# Update with SERVICE_URL
+gcloud run services update ride-watch \
+  --region us-central1 \
+  --update-env-vars "SERVICE_URL=${SERVICE_URL}"
 ```
 
 **Using Secret Manager (recommended for production):**
@@ -143,37 +183,74 @@ gcloud run deploy ride-watch \
   --platform managed \
   --allow-unauthenticated \
   --set-secrets "TWILIO_SID=twilio-sid:latest,TWILIO_TOKEN=twilio-token:latest" \
+  --set-env-vars "DYNAMIC_SCHEDULING=true" \
+  --set-env-vars "CLOUD_TASKS_LOCATION=us-central1" \
+  --set-env-vars "CLOUD_TASKS_QUEUE=ride-watch-queue" \
   --set-env-vars "TWILIO_NUMBER=+1234567890" \
   --set-env-vars "RECIPIENT_NUMBERS=+1234567890" \
   --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
   --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
 ```
 
-### 4. Set up Cloud Scheduler
+### 5. Set up scheduling
+
+**Option A: Cloud Scheduler (static 5-minute intervals)**
 
 ```bash
-# Get the Cloud Run service URL
 SERVICE_URL=$(gcloud run services describe ride-watch --region us-central1 --format 'value(status.url)')
 
-# Create a scheduler job to run every 5 minutes
 gcloud scheduler jobs create http ride-watch-trigger \
   --location us-central1 \
   --schedule "*/5 * * * *" \
   --uri "${SERVICE_URL}/check" \
-  --http-method POST \
-  --oidc-service-account-email "${PROJECT_ID}@appspot.gserviceaccount.com"
+  --http-method POST
 ```
 
-**Note:** If using `--allow-unauthenticated` on Cloud Run, you can omit the `--oidc-service-account-email` flag.
+**Option B: Start dynamic scheduling loop**
 
-### 5. Test the deployment
+With dynamic scheduling enabled, you just need to kick off the first check:
+
+```bash
+SERVICE_URL=$(gcloud run services describe ride-watch --region us-central1 --format 'value(status.url)')
+
+# Start the self-scheduling loop
+curl -X POST "${SERVICE_URL}/start"
+```
+
+The service will then schedule its own future checks:
+- Every 5 minutes when all rides are operating
+- Every 1 minute when any ride is down/closed/refurbishment
+
+**Option C: Hybrid (recommended)**
+
+Use Cloud Scheduler as a backup/recovery mechanism, but let Cloud Tasks handle normal operation:
+
+```bash
+# Create scheduler job at 10-minute intervals as a backup
+gcloud scheduler jobs create http ride-watch-backup \
+  --location us-central1 \
+  --schedule "*/10 * * * *" \
+  --uri "${SERVICE_URL}/check" \
+  --http-method POST
+
+# Start the dynamic scheduling loop
+curl -X POST "${SERVICE_URL}/start"
+```
+
+### 6. Test the deployment
 
 ```bash
 # Health check
 curl ${SERVICE_URL}/health
 
-# Manual trigger
+# Manual trigger (won't auto-schedule next)
+curl ${SERVICE_URL}/check
+
+# Trigger with auto-scheduling
 curl -X POST ${SERVICE_URL}/check
+
+# View service config
+curl ${SERVICE_URL}/
 ```
 
 ## Environment Variables
@@ -188,6 +265,12 @@ curl -X POST ${SERVICE_URL}/check
 | `WATCHED_RIDES` | No | Comma-separated ride names to filter (empty = all) |
 | `GOOGLE_CLOUD_PROJECT` | Auto | GCP project ID (set automatically in Cloud Run) |
 | `PORT` | No | Server port (default: 8080) |
+| `DYNAMIC_SCHEDULING` | No | Set to `true` to enable Cloud Tasks scheduling |
+| `CLOUD_TASKS_LOCATION` | No | Cloud Tasks location (default: us-central1) |
+| `CLOUD_TASKS_QUEUE` | No | Cloud Tasks queue name (default: ride-watch-queue) |
+| `SERVICE_URL` | For dynamic | Cloud Run service URL (required for dynamic scheduling) |
+| `NORMAL_INTERVAL_SEC` | No | Check interval when all rides up (default: 300) |
+| `ALERT_INTERVAL_SEC` | No | Check interval when rides down (default: 60) |
 
 ## API Endpoints
 
@@ -195,20 +278,67 @@ curl -X POST ${SERVICE_URL}/check
 |----------|--------|-------------|
 | `/` | GET | Service info and configuration summary |
 | `/health` | GET | Health check for Cloud Run |
-| `/check` | GET/POST | Trigger status check and send notifications |
+| `/check` | GET | Trigger status check (no auto-scheduling) |
+| `/check` | POST | Trigger status check (auto-schedules next if enabled) |
+| `/start` | POST | Start the dynamic scheduling loop |
+
+## How Dynamic Scheduling Works
+
+```
+                    ┌─────────────────┐
+                    │  POST /start    │
+                    └────────┬────────┘
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │     Check ride status        │
+              │  (ThemeParks Wiki API)       │
+              └──────────────┬───────────────┘
+                             │
+                             ▼
+                    ┌────────────────┐
+                    │ Any rides down?│
+                    └───────┬────────┘
+                           / \
+                          /   \
+                      Yes/     \No
+                        /       \
+                       ▼         ▼
+            ┌──────────────┐  ┌──────────────┐
+            │ Schedule next│  │ Schedule next│
+            │ in 60 sec    │  │ in 300 sec   │
+            │ (Cloud Tasks)│  │ (Cloud Tasks)│
+            └──────┬───────┘  └──────┬───────┘
+                   │                  │
+                   └────────┬─────────┘
+                            │
+                            ▼
+                   (wait for scheduled time)
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ POST /check   │◄────────┐
+                    │ (from Tasks)  │         │
+                    └───────┬───────┘         │
+                            │                 │
+                            └─────────────────┘
+```
 
 ## Ride Status Values
 
 Common status values from the ThemeParks Wiki API:
 
 - `OPERATING` - Ride is running normally
-- `DOWN` - Ride is temporarily closed
-- `CLOSED` - Ride is closed (scheduled)
-- `REFURBISHMENT` - Ride is under refurbishment
+- `DOWN` - Ride is temporarily closed (triggers alert mode)
+- `CLOSED` - Ride is closed/scheduled (triggers alert mode)
+- `REFURBISHMENT` - Ride is under refurbishment (triggers alert mode)
 
 ## Cost Considerations
 
-- **Cloud Run:** Pay only when the service runs (~12 invocations/hour)
+- **Cloud Run:** Pay only when the service runs
+  - Normal mode: ~12 invocations/hour
+  - Alert mode: ~60 invocations/hour
+- **Cloud Tasks:** Free tier covers millions of operations
 - **Firestore:** Free tier covers up to 50k reads/day
 - **Cloud Scheduler:** Free tier covers up to 3 jobs
 - **Twilio:** ~$0.0079/SMS in the US
@@ -224,6 +354,12 @@ Common status values from the ThemeParks Wiki API:
 - First run populates Firestore with initial state (no changes detected)
 - Changes are only detected on subsequent runs
 - Verify PARK_IDS are correct
+
+**Dynamic scheduling not working:**
+- Ensure `DYNAMIC_SCHEDULING=true`
+- Verify `SERVICE_URL` is set correctly
+- Check Cloud Tasks queue exists: `gcloud tasks queues describe ride-watch-queue --location=us-central1`
+- Verify service account has `cloudtasks.tasks.create` permission
 
 **Firestore permission errors:**
 - Ensure the Cloud Run service account has Firestore access
