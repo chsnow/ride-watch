@@ -1,6 +1,7 @@
 import express from 'express';
 import { Firestore } from '@google-cloud/firestore';
 import { CloudTasksClient } from '@google-cloud/tasks';
+import admin from 'firebase-admin';
 import twilio from 'twilio';
 
 // Configuration from environment variables
@@ -16,17 +17,32 @@ const config = {
   projectId: process.env.GOOGLE_CLOUD_PROJECT,
   location: process.env.CLOUD_TASKS_LOCATION || 'us-central1',
   queueName: process.env.CLOUD_TASKS_QUEUE || 'ride-watch-queue',
-  serviceUrl: process.env.SERVICE_URL, // Cloud Run service URL
+  serviceUrl: process.env.SERVICE_URL,
   // Intervals in seconds
-  normalIntervalSec: parseInt(process.env.NORMAL_INTERVAL_SEC || '300', 10), // 5 minutes
-  alertIntervalSec: parseInt(process.env.ALERT_INTERVAL_SEC || '60', 10),    // 1 minute
-  // Feature flag for dynamic scheduling
+  normalIntervalSec: parseInt(process.env.NORMAL_INTERVAL_SEC || '300', 10),
+  alertIntervalSec: parseInt(process.env.ALERT_INTERVAL_SEC || '60', 10),
+  // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
+  enableSms: process.env.ENABLE_SMS !== 'false', // Default true
+  enablePush: process.env.ENABLE_PUSH !== 'false', // Default true
 };
+
+// Initialize Firebase Admin (uses Application Default Credentials in Cloud Run)
+let firebaseInitialized = false;
+try {
+  admin.initializeApp({
+    projectId: config.projectId,
+  });
+  firebaseInitialized = true;
+  console.log('Firebase Admin initialized');
+} catch (error) {
+  console.warn('Firebase Admin initialization failed:', error.message);
+}
 
 // Initialize Firestore
 const firestore = new Firestore();
 const statusCollection = firestore.collection('ride-status');
+const devicesCollection = firestore.collection('devices');
 
 // Initialize Cloud Tasks client
 const tasksClient = new CloudTasksClient();
@@ -78,21 +94,142 @@ async function saveStatus(rideId, status, rideName) {
 }
 
 /**
+ * Get all registered device tokens from Firestore
+ */
+async function getDeviceTokens() {
+  const snapshot = await devicesCollection.where('active', '==', true).get();
+  return snapshot.docs.map(doc => ({
+    token: doc.id,
+    ...doc.data(),
+  }));
+}
+
+/**
+ * Register a device token
+ */
+async function registerDevice(token, metadata = {}) {
+  await devicesCollection.doc(token).set({
+    active: true,
+    registeredAt: new Date().toISOString(),
+    lastUpdated: new Date().toISOString(),
+    platform: metadata.platform || 'ios',
+    ...metadata,
+  }, { merge: true });
+}
+
+/**
+ * Unregister a device token
+ */
+async function unregisterDevice(token) {
+  await devicesCollection.doc(token).update({
+    active: false,
+    unregisteredAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Mark a device token as invalid (for cleanup)
+ */
+async function markTokenInvalid(token) {
+  await devicesCollection.doc(token).update({
+    active: false,
+    invalid: true,
+    invalidatedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Send push notification via Firebase Cloud Messaging
+ */
+async function sendPushNotification(title, body, data = {}) {
+  if (!firebaseInitialized) {
+    console.warn('Firebase not initialized, skipping push notification');
+    return { sent: 0, failed: 0 };
+  }
+
+  if (!config.enablePush) {
+    console.log('Push notifications disabled');
+    return { sent: 0, failed: 0 };
+  }
+
+  const devices = await getDeviceTokens();
+  if (devices.length === 0) {
+    console.log('No registered devices for push notifications');
+    return { sent: 0, failed: 0 };
+  }
+
+  console.log(`Sending push notification to ${devices.length} device(s)`);
+
+  let sent = 0;
+  let failed = 0;
+
+  // Send to each device individually to handle errors per-device
+  for (const device of devices) {
+    try {
+      const message = {
+        token: device.token,
+        notification: {
+          title,
+          body,
+        },
+        data: {
+          ...data,
+          timestamp: new Date().toISOString(),
+        },
+        apns: {
+          payload: {
+            aps: {
+              sound: 'default',
+              badge: 1,
+            },
+          },
+        },
+      };
+
+      await admin.messaging().send(message);
+      sent++;
+      console.log(`Push sent to device ${device.token.slice(0, 20)}...`);
+    } catch (error) {
+      failed++;
+      console.error(`Failed to send push to ${device.token.slice(0, 20)}...:`, error.message);
+
+      // Mark invalid tokens for cleanup
+      if (
+        error.code === 'messaging/invalid-registration-token' ||
+        error.code === 'messaging/registration-token-not-registered'
+      ) {
+        console.log(`Marking invalid token: ${device.token.slice(0, 20)}...`);
+        await markTokenInvalid(device.token);
+      }
+    }
+  }
+
+  return { sent, failed };
+}
+
+/**
  * Send SMS notification via Twilio
  */
 async function sendSmsNotification(message) {
   if (!twilioClient) {
     console.warn('Twilio not configured, skipping SMS notification');
-    console.log(`Would have sent: ${message}`);
-    return;
+    return { sent: 0, failed: 0 };
+  }
+
+  if (!config.enableSms) {
+    console.log('SMS notifications disabled');
+    return { sent: 0, failed: 0 };
   }
 
   if (config.recipientNumbers.length === 0) {
     console.warn('No recipient numbers configured');
-    return;
+    return { sent: 0, failed: 0 };
   }
 
   console.log(`Sending SMS to ${config.recipientNumbers.length} recipient(s)`);
+
+  let sent = 0;
+  let failed = 0;
 
   const sendPromises = config.recipientNumbers.map(async (to) => {
     try {
@@ -101,13 +238,34 @@ async function sendSmsNotification(message) {
         from: config.twilioNumber,
         to: to.trim(),
       });
+      sent++;
       console.log(`SMS sent to ${to}`);
     } catch (error) {
+      failed++;
       console.error(`Failed to send SMS to ${to}:`, error.message);
     }
   });
 
   await Promise.all(sendPromises);
+  return { sent, failed };
+}
+
+/**
+ * Send notification via all configured channels (SMS + Push)
+ */
+async function sendNotification(title, body, data = {}) {
+  const results = {
+    sms: { sent: 0, failed: 0 },
+    push: { sent: 0, failed: 0 },
+  };
+
+  // Send SMS (body only, no title)
+  results.sms = await sendSmsNotification(body);
+
+  // Send push notification
+  results.push = await sendPushNotification(title, body, data);
+
+  return results;
 }
 
 /**
@@ -115,7 +273,7 @@ async function sendSmsNotification(message) {
  */
 function shouldMonitorRide(rideName) {
   if (config.watchedRides.length === 0) {
-    return true; // Monitor all rides if no filter set
+    return true;
   }
   return config.watchedRides.some(watched =>
     rideName.toLowerCase().includes(watched.toLowerCase().trim())
@@ -134,6 +292,22 @@ function isDownStatus(status) {
  */
 function formatStatusMessage(rideName, oldStatus, newStatus) {
   return `🎢 ${rideName}: ${oldStatus || 'Unknown'} → ${newStatus}`;
+}
+
+/**
+ * Get notification title based on status change
+ */
+function getNotificationTitle(newStatus) {
+  if (newStatus === 'OPERATING') {
+    return 'Ride Back Up! 🎉';
+  } else if (newStatus === 'DOWN') {
+    return 'Ride Down ⚠️';
+  } else if (newStatus === 'CLOSED') {
+    return 'Ride Closed';
+  } else if (newStatus === 'REFURBISHMENT') {
+    return 'Ride Under Refurbishment';
+  }
+  return 'Ride Status Changed';
 }
 
 /**
@@ -183,7 +357,7 @@ async function scheduleNextCheck(delaySeconds) {
 async function checkStatusChanges() {
   if (config.parkIds.length === 0) {
     console.warn('No park IDs configured');
-    return { checked: 0, changes: 0, ridesDown: 0 };
+    return { checked: 0, changes: 0, ridesDown: 0, notifications: null };
   }
 
   let totalChecked = 0;
@@ -200,7 +374,6 @@ async function checkStatusChanges() {
         continue;
       }
 
-      // Filter to only ATTRACTION entity types
       const attractions = liveData.liveData.filter(
         entity => entity.entityType === 'ATTRACTION'
       );
@@ -212,34 +385,30 @@ async function checkStatusChanges() {
         const rideName = attraction.name;
         const currentStatus = attraction.status || 'UNKNOWN';
 
-        // Skip if not in watched list
         if (!shouldMonitorRide(rideName)) {
           continue;
         }
 
         totalChecked++;
 
-        // Track if ride is down
         if (isDownStatus(currentStatus)) {
           ridesDown++;
         }
 
-        // Get previous status from Firestore
         const previousData = await getPreviousStatus(rideId);
         const previousStatus = previousData?.status;
 
-        // Check for status change
         if (previousStatus && previousStatus !== currentStatus) {
           console.log(`Status change detected: ${rideName} (${previousStatus} → ${currentStatus})`);
           totalChanges++;
           statusChanges.push({
+            rideId,
             rideName,
             oldStatus: previousStatus,
             newStatus: currentStatus,
           });
         }
 
-        // Save current status
         await saveStatus(rideId, currentStatus, rideName);
       }
     } catch (error) {
@@ -248,25 +417,36 @@ async function checkStatusChanges() {
   }
 
   // Send notifications for all status changes
+  let notificationResults = null;
   if (statusChanges.length > 0) {
-    // Group messages if there are multiple changes
     if (statusChanges.length <= 3) {
-      // Send individual messages for small number of changes
+      // Send individual notifications for small number of changes
       for (const change of statusChanges) {
-        const message = formatStatusMessage(change.rideName, change.oldStatus, change.newStatus);
-        await sendSmsNotification(message);
+        const title = getNotificationTitle(change.newStatus);
+        const body = formatStatusMessage(change.rideName, change.oldStatus, change.newStatus);
+        notificationResults = await sendNotification(title, body, {
+          rideId: change.rideId,
+          rideName: change.rideName,
+          oldStatus: change.oldStatus,
+          newStatus: change.newStatus,
+          type: 'status_change',
+        });
       }
     } else {
-      // Send a summary message for many changes
+      // Send a summary for many changes
       const messages = statusChanges.map(change =>
         `• ${change.rideName}: ${change.oldStatus} → ${change.newStatus}`
       );
-      const summaryMessage = `🎢 ${statusChanges.length} ride status changes:\n${messages.join('\n')}`;
-      await sendSmsNotification(summaryMessage);
+      const title = `${statusChanges.length} Ride Status Changes`;
+      const body = `🎢 ${statusChanges.length} rides changed:\n${messages.join('\n')}`;
+      notificationResults = await sendNotification(title, body, {
+        type: 'status_change_summary',
+        count: statusChanges.length.toString(),
+      });
     }
   }
 
-  return { checked: totalChecked, changes: totalChanges, ridesDown };
+  return { checked: totalChecked, changes: totalChanges, ridesDown, notifications: notificationResults };
 }
 
 // Express app
@@ -278,6 +458,82 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
+// Register device for push notifications
+app.post('/devices', async (req, res) => {
+  const { token, platform, deviceName } = req.body;
+
+  if (!token) {
+    return res.status(400).json({ error: 'Token is required' });
+  }
+
+  try {
+    await registerDevice(token, { platform, deviceName });
+    console.log(`Device registered: ${token.slice(0, 20)}... (${platform || 'ios'})`);
+    res.status(200).json({
+      success: true,
+      message: 'Device registered for push notifications',
+    });
+  } catch (error) {
+    console.error('Error registering device:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Unregister device
+app.delete('/devices/:token', async (req, res) => {
+  const { token } = req.params;
+
+  try {
+    await unregisterDevice(token);
+    console.log(`Device unregistered: ${token.slice(0, 20)}...`);
+    res.status(200).json({
+      success: true,
+      message: 'Device unregistered',
+    });
+  } catch (error) {
+    console.error('Error unregistering device:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List registered devices (for debugging)
+app.get('/devices', async (req, res) => {
+  try {
+    const devices = await getDeviceTokens();
+    res.status(200).json({
+      count: devices.length,
+      devices: devices.map(d => ({
+        token: `${d.token.slice(0, 20)}...`,
+        platform: d.platform,
+        registeredAt: d.registeredAt,
+      })),
+    });
+  } catch (error) {
+    console.error('Error listing devices:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test push notification endpoint
+app.post('/test-push', async (req, res) => {
+  const { title, body } = req.body;
+
+  try {
+    const result = await sendPushNotification(
+      title || 'Test Notification',
+      body || 'This is a test push notification from ride-watch',
+      { type: 'test' }
+    );
+    res.status(200).json({
+      success: true,
+      result,
+    });
+  } catch (error) {
+    console.error('Error sending test push:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Main check endpoint (triggered by Cloud Scheduler or Cloud Tasks)
 app.post('/check', async (req, res) => {
   console.log('Starting ride status check...');
@@ -287,7 +543,6 @@ app.post('/check', async (req, res) => {
     const result = await checkStatusChanges();
     const duration = Date.now() - startTime;
 
-    // Determine next check interval based on rides down
     const nextInterval = result.ridesDown > 0
       ? config.alertIntervalSec
       : config.normalIntervalSec;
@@ -295,7 +550,6 @@ app.post('/check', async (req, res) => {
     console.log(`Check complete: ${result.checked} rides checked, ${result.changes} changes, ${result.ridesDown} down (${duration}ms)`);
     console.log(`Next check in ${nextInterval}s (${result.ridesDown > 0 ? 'alert mode' : 'normal mode'})`);
 
-    // Schedule next check dynamically
     await scheduleNextCheck(nextInterval);
 
     res.status(200).json({
@@ -303,16 +557,14 @@ app.post('/check', async (req, res) => {
       ridesChecked: result.checked,
       statusChanges: result.changes,
       ridesDown: result.ridesDown,
+      notifications: result.notifications,
       nextCheckSec: nextInterval,
       mode: result.ridesDown > 0 ? 'alert' : 'normal',
       durationMs: duration,
     });
   } catch (error) {
     console.error('Error during status check:', error);
-
-    // Even on error, schedule next check at normal interval
     await scheduleNextCheck(config.normalIntervalSec);
-
     res.status(500).json({
       success: false,
       error: error.message,
@@ -335,12 +587,12 @@ app.get('/check', async (req, res) => {
 
     console.log(`Check complete: ${result.checked} rides checked, ${result.changes} changes, ${result.ridesDown} down (${duration}ms)`);
 
-    // Don't auto-schedule on GET (manual test), but show what would happen
     res.status(200).json({
       success: true,
       ridesChecked: result.checked,
       statusChanges: result.changes,
       ridesDown: result.ridesDown,
+      notifications: result.notifications,
       nextCheckSec: nextInterval,
       mode: result.ridesDown > 0 ? 'alert' : 'normal',
       durationMs: duration,
@@ -360,7 +612,7 @@ app.post('/start', async (req, res) => {
   console.log('Starting scheduling loop...');
 
   try {
-    await scheduleNextCheck(1); // Schedule first check in 1 second
+    await scheduleNextCheck(1);
     res.status(200).json({
       success: true,
       message: 'Scheduling loop started',
@@ -383,12 +635,15 @@ app.get('/', (req, res) => {
       '/health': 'Health check',
       '/check': 'Trigger status check (POST auto-schedules next, GET does not)',
       '/start': 'Start the dynamic scheduling loop (POST)',
+      '/devices': 'Register (POST), unregister (DELETE), or list (GET) devices',
+      '/test-push': 'Send a test push notification (POST)',
     },
     config: {
       parksMonitored: config.parkIds.length,
       watchedRides: config.watchedRides.length || 'all',
-      recipientNumbers: config.recipientNumbers.length,
-      twilioConfigured: !!twilioClient,
+      smsRecipients: config.recipientNumbers.length,
+      smsEnabled: config.enableSms && !!twilioClient,
+      pushEnabled: config.enablePush && firebaseInitialized,
       dynamicScheduling: config.dynamicScheduling,
       normalIntervalSec: config.normalIntervalSec,
       alertIntervalSec: config.alertIntervalSec,
@@ -401,7 +656,8 @@ app.listen(config.port, () => {
   console.log(`ride-watch service listening on port ${config.port}`);
   console.log(`Monitoring ${config.parkIds.length} park(s)`);
   console.log(`Watching ${config.watchedRides.length || 'all'} ride(s)`);
-  console.log(`SMS recipients: ${config.recipientNumbers.length}`);
+  console.log(`SMS: ${config.enableSms && twilioClient ? `enabled (${config.recipientNumbers.length} recipients)` : 'disabled'}`);
+  console.log(`Push: ${config.enablePush && firebaseInitialized ? 'enabled' : 'disabled'}`);
   console.log(`Dynamic scheduling: ${config.dynamicScheduling ? 'enabled' : 'disabled'}`);
   if (config.dynamicScheduling) {
     console.log(`  Normal interval: ${config.normalIntervalSec}s, Alert interval: ${config.alertIntervalSec}s`);

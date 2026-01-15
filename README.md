@@ -1,22 +1,23 @@
 # ride-watch
 
-A serverless service that monitors Disney theme park attraction status and sends SMS notifications when rides go down or come back up.
+A serverless service that monitors Disney theme park attraction status and sends notifications when rides go down or come back up.
 
 ## Features
 
 - Monitors attraction status from any Disney park (or other parks supported by ThemeParks Wiki API)
-- Sends SMS notifications via Twilio when ride status changes
+- **Push notifications** via Firebase Cloud Messaging (iOS/Android)
+- **SMS notifications** via Twilio
 - Runs on Google Cloud Run with Cloud Scheduler triggers
 - Persists state in Firestore between invocations
 - Filter to monitor only specific rides or all attractions
-- Supports multiple SMS recipients
 - **Dynamic scheduling**: Checks every 5 minutes normally, every 1 minute when any ride is down
 
 ## Prerequisites
 
 - Node.js 20+
 - Google Cloud account with billing enabled
-- Twilio account
+- Firebase project (for push notifications)
+- Twilio account (for SMS - optional)
 - gcloud CLI installed and configured
 
 ## Finding Park Entity IDs
@@ -43,7 +44,77 @@ The service uses the [ThemeParks Wiki API](https://api.themeparks.wiki). To find
    curl https://api.themeparks.wiki/v1/entity/75ea578a-adc8-4116-a54d-dccb60765ef9/live | jq
    ```
 
-## Twilio Setup
+## Firebase Setup (Push Notifications)
+
+### 1. Create/Link Firebase Project
+
+```bash
+# If you don't have a Firebase project linked to your GCP project:
+firebase projects:create $PROJECT_ID
+# Or link existing: firebase projects:addfirebase $PROJECT_ID
+```
+
+Or use the [Firebase Console](https://console.firebase.google.com):
+1. Click "Add project"
+2. Select your existing GCP project
+3. Enable Google Analytics (optional)
+
+### 2. Add iOS App to Firebase
+
+1. Go to Firebase Console → Project Settings → General
+2. Click "Add app" → iOS
+3. Enter your iOS bundle ID (e.g., `com.yourcompany.ridewatch`)
+4. Download `GoogleService-Info.plist`
+5. Add to your Xcode project
+
+### 3. Enable Cloud Messaging
+
+1. Go to Firebase Console → Project Settings → Cloud Messaging
+2. For iOS, upload your APNs authentication key:
+   - Go to [Apple Developer](https://developer.apple.com/account/resources/authkeys/list)
+   - Create a new key with "Apple Push Notifications service (APNs)"
+   - Download the `.p8` file
+   - Upload to Firebase with your Key ID and Team ID
+
+### 4. iOS App Requirements
+
+Your iOS app needs to:
+
+```swift
+// 1. Request notification permissions
+import UserNotifications
+import FirebaseMessaging
+
+func requestNotificationPermission() {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
+        if granted {
+            DispatchQueue.main.async {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
+    }
+}
+
+// 2. Get FCM token and register with ride-watch service
+func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+    guard let token = fcmToken else { return }
+
+    // Register token with ride-watch backend
+    let url = URL(string: "https://your-service.run.app/devices")!
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONEncoder().encode([
+        "token": token,
+        "platform": "ios",
+        "deviceName": UIDevice.current.name
+    ])
+
+    URLSession.shared.dataTask(with: request).resume()
+}
+```
+
+## Twilio Setup (SMS - Optional)
 
 1. **Create a Twilio account** at https://www.twilio.com
 
@@ -87,6 +158,16 @@ The service uses the [ThemeParks Wiki API](https://api.themeparks.wiki). To find
 
    # Trigger a status check
    curl http://localhost:8080/check
+
+   # Register a test device
+   curl -X POST http://localhost:8080/devices \
+     -H "Content-Type: application/json" \
+     -d '{"token": "test-token", "platform": "ios"}'
+
+   # Send test push notification
+   curl -X POST http://localhost:8080/test-push \
+     -H "Content-Type: application/json" \
+     -d '{"title": "Test", "body": "Hello from ride-watch!"}'
    ```
 
 ## Google Cloud Deployment
@@ -104,7 +185,9 @@ gcloud services enable \
   firestore.googleapis.com \
   cloudscheduler.googleapis.com \
   cloudtasks.googleapis.com \
-  cloudbuild.googleapis.com
+  cloudbuild.googleapis.com \
+  firebase.googleapis.com \
+  fcm.googleapis.com
 ```
 
 ### 2. Create Firestore database
@@ -123,7 +206,7 @@ gcloud tasks queues create ride-watch-queue --location=us-central1
 
 ### 4. Deploy to Cloud Run
 
-**Option A: Static scheduling (Cloud Scheduler only)**
+**Push notifications only (no SMS):**
 
 ```bash
 gcloud run deploy ride-watch \
@@ -131,18 +214,14 @@ gcloud run deploy ride-watch \
   --region us-central1 \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars "TWILIO_SID=your_sid" \
-  --set-env-vars "TWILIO_TOKEN=your_token" \
-  --set-env-vars "TWILIO_NUMBER=+1234567890" \
-  --set-env-vars "RECIPIENT_NUMBERS=+1234567890" \
+  --set-env-vars "ENABLE_SMS=false" \
   --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
   --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
 ```
 
-**Option B: Dynamic scheduling (recommended)**
+**Both push and SMS:**
 
 ```bash
-# First deploy to get the service URL
 gcloud run deploy ride-watch \
   --source . \
   --region us-central1 \
@@ -151,8 +230,6 @@ gcloud run deploy ride-watch \
   --set-env-vars "DYNAMIC_SCHEDULING=true" \
   --set-env-vars "CLOUD_TASKS_LOCATION=us-central1" \
   --set-env-vars "CLOUD_TASKS_QUEUE=ride-watch-queue" \
-  --set-env-vars "NORMAL_INTERVAL_SEC=300" \
-  --set-env-vars "ALERT_INTERVAL_SEC=60" \
   --set-env-vars "TWILIO_SID=your_sid" \
   --set-env-vars "TWILIO_TOKEN=your_token" \
   --set-env-vars "TWILIO_NUMBER=+1234567890" \
@@ -160,36 +237,11 @@ gcloud run deploy ride-watch \
   --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
   --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
 
-# Get the service URL
+# Get the service URL and update
 SERVICE_URL=$(gcloud run services describe ride-watch --region us-central1 --format 'value(status.url)')
-
-# Update with SERVICE_URL
 gcloud run services update ride-watch \
   --region us-central1 \
   --update-env-vars "SERVICE_URL=${SERVICE_URL}"
-```
-
-**Using Secret Manager (recommended for production):**
-
-```bash
-# Create secrets
-echo -n "your_twilio_sid" | gcloud secrets create twilio-sid --data-file=-
-echo -n "your_twilio_token" | gcloud secrets create twilio-token --data-file=-
-
-# Deploy with secrets
-gcloud run deploy ride-watch \
-  --source . \
-  --region us-central1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --set-secrets "TWILIO_SID=twilio-sid:latest,TWILIO_TOKEN=twilio-token:latest" \
-  --set-env-vars "DYNAMIC_SCHEDULING=true" \
-  --set-env-vars "CLOUD_TASKS_LOCATION=us-central1" \
-  --set-env-vars "CLOUD_TASKS_QUEUE=ride-watch-queue" \
-  --set-env-vars "TWILIO_NUMBER=+1234567890" \
-  --set-env-vars "RECIPIENT_NUMBERS=+1234567890" \
-  --set-env-vars "PARK_IDS=75ea578a-adc8-4116-a54d-dccb60765ef9" \
-  --set-env-vars "WATCHED_RIDES=Space Mountain,Haunted Mansion"
 ```
 
 ### 5. Set up scheduling
@@ -208,22 +260,11 @@ gcloud scheduler jobs create http ride-watch-trigger \
 
 **Option B: Start dynamic scheduling loop**
 
-With dynamic scheduling enabled, you just need to kick off the first check:
-
 ```bash
-SERVICE_URL=$(gcloud run services describe ride-watch --region us-central1 --format 'value(status.url)')
-
-# Start the self-scheduling loop
 curl -X POST "${SERVICE_URL}/start"
 ```
 
-The service will then schedule its own future checks:
-- Every 5 minutes when all rides are operating
-- Every 1 minute when any ride is down/closed/refurbishment
-
 **Option C: Hybrid (recommended)**
-
-Use Cloud Scheduler as a backup/recovery mechanism, but let Cloud Tasks handle normal operation:
 
 ```bash
 # Create scheduler job at 10-minute intervals as a backup
@@ -243,28 +284,32 @@ curl -X POST "${SERVICE_URL}/start"
 # Health check
 curl ${SERVICE_URL}/health
 
-# Manual trigger (won't auto-schedule next)
-curl ${SERVICE_URL}/check
-
-# Trigger with auto-scheduling
-curl -X POST ${SERVICE_URL}/check
-
 # View service config
 curl ${SERVICE_URL}/
+
+# List registered devices
+curl ${SERVICE_URL}/devices
+
+# Send test push notification
+curl -X POST ${SERVICE_URL}/test-push \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Test", "body": "Push notifications are working!"}'
 ```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TWILIO_SID` | Yes | Twilio Account SID |
-| `TWILIO_TOKEN` | Yes | Twilio Auth Token |
-| `TWILIO_NUMBER` | Yes | Twilio phone number (E.164 format) |
-| `RECIPIENT_NUMBERS` | Yes | Comma-separated recipient phone numbers |
 | `PARK_IDS` | Yes | Comma-separated park entity IDs to monitor |
 | `WATCHED_RIDES` | No | Comma-separated ride names to filter (empty = all) |
 | `GOOGLE_CLOUD_PROJECT` | Auto | GCP project ID (set automatically in Cloud Run) |
 | `PORT` | No | Server port (default: 8080) |
+| `ENABLE_SMS` | No | Enable SMS notifications (default: true) |
+| `ENABLE_PUSH` | No | Enable push notifications (default: true) |
+| `TWILIO_SID` | For SMS | Twilio Account SID |
+| `TWILIO_TOKEN` | For SMS | Twilio Auth Token |
+| `TWILIO_NUMBER` | For SMS | Twilio phone number (E.164 format) |
+| `RECIPIENT_NUMBERS` | For SMS | Comma-separated recipient phone numbers |
 | `DYNAMIC_SCHEDULING` | No | Set to `true` to enable Cloud Tasks scheduling |
 | `CLOUD_TASKS_LOCATION` | No | Cloud Tasks location (default: us-central1) |
 | `CLOUD_TASKS_QUEUE` | No | Cloud Tasks queue name (default: ride-watch-queue) |
@@ -281,47 +326,51 @@ curl ${SERVICE_URL}/
 | `/check` | GET | Trigger status check (no auto-scheduling) |
 | `/check` | POST | Trigger status check (auto-schedules next if enabled) |
 | `/start` | POST | Start the dynamic scheduling loop |
+| `/devices` | GET | List registered devices |
+| `/devices` | POST | Register device for push notifications |
+| `/devices/:token` | DELETE | Unregister a device |
+| `/test-push` | POST | Send a test push notification |
 
-## How Dynamic Scheduling Works
+## Device Registration
+
+iOS/Android apps register for push notifications by calling:
+
+```bash
+POST /devices
+Content-Type: application/json
+
+{
+  "token": "fcm-device-token-from-firebase-sdk",
+  "platform": "ios",
+  "deviceName": "John's iPhone"  // optional
+}
+```
+
+Device tokens are stored in Firestore's `devices` collection. Invalid tokens are automatically marked inactive when FCM returns an error.
+
+## Notification Flow
 
 ```
-                    ┌─────────────────┐
-                    │  POST /start    │
-                    └────────┬────────┘
-                             │
-                             ▼
-              ┌──────────────────────────────┐
-              │     Check ride status        │
-              │  (ThemeParks Wiki API)       │
-              └──────────────┬───────────────┘
-                             │
-                             ▼
-                    ┌────────────────┐
-                    │ Any rides down?│
-                    └───────┬────────┘
-                           / \
-                          /   \
-                      Yes/     \No
-                        /       \
-                       ▼         ▼
-            ┌──────────────┐  ┌──────────────┐
-            │ Schedule next│  │ Schedule next│
-            │ in 60 sec    │  │ in 300 sec   │
-            │ (Cloud Tasks)│  │ (Cloud Tasks)│
-            └──────┬───────┘  └──────┬───────┘
-                   │                  │
-                   └────────┬─────────┘
-                            │
-                            ▼
-                   (wait for scheduled time)
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ POST /check   │◄────────┐
-                    │ (from Tasks)  │         │
-                    └───────┬───────┘         │
-                            │                 │
-                            └─────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│  iOS App    │────▶│  Firestore   │     │ ride-watch  │
+│ registers   │     │  (devices    │◀────│  service    │
+│  token      │     │  collection) │     │             │
+└─────────────┘     └──────────────┘     └──────┬──────┘
+                                                │
+                           ┌────────────────────┼────────────────────┐
+                           │                    │                    │
+                           ▼                    ▼                    ▼
+                    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+                    │    FCM      │      │   Twilio    │      │  Firestore  │
+                    │  (push to   │      │   (SMS)     │      │  (state)    │
+                    │   devices)  │      │             │      │             │
+                    └──────┬──────┘      └─────────────┘      └─────────────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │   APNs      │
+                    │  (to iOS)   │
+                    └─────────────┘
 ```
 
 ## Ride Status Values
@@ -341,14 +390,22 @@ Common status values from the ThemeParks Wiki API:
 - **Cloud Tasks:** Free tier covers millions of operations
 - **Firestore:** Free tier covers up to 50k reads/day
 - **Cloud Scheduler:** Free tier covers up to 3 jobs
+- **Firebase Cloud Messaging:** Free (no per-message cost)
 - **Twilio:** ~$0.0079/SMS in the US
 
 ## Troubleshooting
 
+**No push notifications received:**
+- Check device is registered: `curl ${SERVICE_URL}/devices`
+- Verify Firebase project is set up correctly
+- Check APNs key is uploaded in Firebase Console
+- Test with: `curl -X POST ${SERVICE_URL}/test-push`
+- Check Cloud Run logs: `gcloud run services logs read ride-watch`
+
 **No SMS received:**
+- Check `ENABLE_SMS=true`
 - Check Twilio credentials are correct
 - Verify phone numbers are in E.164 format
-- Check Cloud Run logs: `gcloud run services logs read ride-watch`
 
 **No status changes detected:**
 - First run populates Firestore with initial state (no changes detected)
@@ -359,11 +416,11 @@ Common status values from the ThemeParks Wiki API:
 - Ensure `DYNAMIC_SCHEDULING=true`
 - Verify `SERVICE_URL` is set correctly
 - Check Cloud Tasks queue exists: `gcloud tasks queues describe ride-watch-queue --location=us-central1`
-- Verify service account has `cloudtasks.tasks.create` permission
 
-**Firestore permission errors:**
-- Ensure the Cloud Run service account has Firestore access
-- Default service account usually has access automatically
+**Invalid device tokens:**
+- Tokens are automatically marked invalid when FCM returns errors
+- Check Firestore `devices` collection for `invalid: true` entries
+- App should re-register token when it refreshes
 
 ## License
 
