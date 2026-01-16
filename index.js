@@ -14,8 +14,7 @@ const config = {
   queueName: process.env.CLOUD_TASKS_QUEUE || 'ride-watch-queue',
   serviceUrl: process.env.SERVICE_URL,
   // Intervals in seconds
-  normalIntervalSec: parseInt(process.env.NORMAL_INTERVAL_SEC || '300', 10),
-  alertIntervalSec: parseInt(process.env.ALERT_INTERVAL_SEC || '60', 10),
+  checkIntervalSec: parseInt(process.env.CHECK_INTERVAL_SEC || '30', 10),
   // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
 };
@@ -40,15 +39,76 @@ const devicesCollection = firestore.collection('devices');
 // Initialize Cloud Tasks client
 const tasksClient = new CloudTasksClient();
 
-// ThemeParks Wiki API base URL
-const API_BASE = 'https://api.themeparks.wiki/v1';
+// ============================================
+// IN-MEMORY CACHE
+// ============================================
 
-// Non-operating statuses that trigger faster polling
-const DOWN_STATUSES = new Set(['DOWN', 'REFURBISHMENT', 'CLOSED']);
+// Cache for ride statuses: { rideId: { status, rideName, updatedAt } }
+const statusCache = new Map();
+let statusCacheInitialized = false;
+
+// Cache for device tokens: { tokens: [...], loadedAt: timestamp }
+let deviceCache = { tokens: [], loadedAt: 0 };
+const DEVICE_CACHE_TTL_MS = 60000; // Refresh device list every 60 seconds
 
 /**
- * Fetch live attraction data for a park
+ * Initialize status cache from Firestore (only on cold start)
  */
+async function initializeStatusCache() {
+  if (statusCacheInitialized) return;
+
+  console.log('Initializing status cache from Firestore...');
+  try {
+    const snapshot = await statusCollection.get();
+    snapshot.forEach(doc => {
+      statusCache.set(doc.id, doc.data());
+    });
+    statusCacheInitialized = true;
+    console.log(`Status cache initialized with ${statusCache.size} rides`);
+  } catch (error) {
+    console.error('Failed to initialize status cache:', error.message);
+    // Continue without cache - will populate as we go
+    statusCacheInitialized = true;
+  }
+}
+
+/**
+ * Get previous status from cache (no Firestore read)
+ */
+function getPreviousStatus(rideId) {
+  return statusCache.get(rideId) || null;
+}
+
+/**
+ * Save status to cache and Firestore (only if changed)
+ */
+async function saveStatus(rideId, status, rideName) {
+  const previous = statusCache.get(rideId);
+  const hasChanged = !previous || previous.status !== status;
+
+  // Always update cache
+  const data = {
+    status,
+    rideName,
+    updatedAt: new Date().toISOString(),
+  };
+  statusCache.set(rideId, data);
+
+  // Only write to Firestore if status changed
+  if (hasChanged) {
+    await statusCollection.doc(rideId).set(data);
+    return true; // Indicates a write occurred
+  }
+  return false;
+}
+
+// ============================================
+// ThemeParks Wiki API
+// ============================================
+
+const API_BASE = 'https://api.themeparks.wiki/v1';
+const DOWN_STATUSES = new Set(['DOWN', 'REFURBISHMENT', 'CLOSED']);
+
 async function fetchParkLiveData(parkId) {
   const url = `${API_BASE}/entity/${parkId}/live`;
   console.log(`Fetching live data for park: ${parkId}`);
@@ -58,45 +118,36 @@ async function fetchParkLiveData(parkId) {
     throw new Error(`Failed to fetch park data: ${response.status} ${response.statusText}`);
   }
 
-  const data = await response.json();
-  return data;
+  return response.json();
 }
 
-/**
- * Get previous status from Firestore
- */
-async function getPreviousStatus(rideId) {
-  const doc = await statusCollection.doc(rideId).get();
-  return doc.exists ? doc.data() : null;
-}
+// ============================================
+// DEVICE MANAGEMENT (with caching)
+// ============================================
 
-/**
- * Save current status to Firestore
- */
-async function saveStatus(rideId, status, rideName) {
-  await statusCollection.doc(rideId).set({
-    status,
-    rideName,
-    updatedAt: new Date().toISOString(),
-  });
-}
-
-/**
- * Get all registered device tokens from Firestore
- */
 async function getDeviceTokens() {
+  const now = Date.now();
+
+  // Return cached tokens if still fresh
+  if (deviceCache.tokens.length > 0 && (now - deviceCache.loadedAt) < DEVICE_CACHE_TTL_MS) {
+    return deviceCache.tokens;
+  }
+
+  // Refresh from Firestore
+  console.log('Refreshing device tokens from Firestore...');
   const snapshot = await devicesCollection.where('active', '==', true).get();
-  return snapshot.docs.map(doc => ({
+  const tokens = snapshot.docs.map(doc => ({
     token: doc.id,
     ...doc.data(),
   }));
+
+  deviceCache = { tokens, loadedAt: now };
+  console.log(`Device cache refreshed: ${tokens.length} active device(s)`);
+
+  return tokens;
 }
 
-/**
- * Register a device token
- */
 async function registerDevice(token, metadata = {}) {
-  // Filter out undefined values
   const cleanMetadata = Object.fromEntries(
     Object.entries(metadata).filter(([_, v]) => v !== undefined)
   );
@@ -108,32 +159,36 @@ async function registerDevice(token, metadata = {}) {
     platform: cleanMetadata.platform || 'ios',
     ...cleanMetadata,
   }, { merge: true });
+
+  // Invalidate device cache
+  deviceCache.loadedAt = 0;
 }
 
-/**
- * Unregister a device token
- */
 async function unregisterDevice(token) {
   await devicesCollection.doc(token).update({
     active: false,
     unregisteredAt: new Date().toISOString(),
   });
+
+  // Invalidate device cache
+  deviceCache.loadedAt = 0;
 }
 
-/**
- * Mark a device token as invalid (for cleanup)
- */
 async function markTokenInvalid(token) {
   await devicesCollection.doc(token).update({
     active: false,
     invalid: true,
     invalidatedAt: new Date().toISOString(),
   });
+
+  // Invalidate device cache
+  deviceCache.loadedAt = 0;
 }
 
-/**
- * Send push notification via Firebase Cloud Messaging
- */
+// ============================================
+// PUSH NOTIFICATIONS
+// ============================================
+
 async function sendPushNotification(title, body, data = {}) {
   if (!firebaseInitialized) {
     console.warn('Firebase not initialized, skipping push notification');
@@ -155,10 +210,7 @@ async function sendPushNotification(title, body, data = {}) {
     try {
       const message = {
         token: device.token,
-        notification: {
-          title,
-          body,
-        },
+        notification: { title, body },
         data: {
           ...data,
           timestamp: new Date().toISOString(),
@@ -193,51 +245,37 @@ async function sendPushNotification(title, body, data = {}) {
   return { sent, failed };
 }
 
-/**
- * Check if a ride should be monitored based on watched rides config
- */
+// ============================================
+// HELPERS
+// ============================================
+
 function shouldMonitorRide(rideName) {
-  if (config.watchedRides.length === 0) {
-    return true;
-  }
+  if (config.watchedRides.length === 0) return true;
   return config.watchedRides.some(watched =>
     rideName.toLowerCase().includes(watched.toLowerCase().trim())
   );
 }
 
-/**
- * Check if a status is considered "down"
- */
 function isDownStatus(status) {
   return DOWN_STATUSES.has(status);
 }
 
-/**
- * Format status change message
- */
 function formatStatusMessage(rideName, oldStatus, newStatus) {
   return `${rideName}: ${oldStatus || 'Unknown'} → ${newStatus}`;
 }
 
-/**
- * Get notification title based on status change
- */
 function getNotificationTitle(newStatus) {
-  if (newStatus === 'OPERATING') {
-    return 'Ride Back Up! 🎉';
-  } else if (newStatus === 'DOWN') {
-    return 'Ride Down ⚠️';
-  } else if (newStatus === 'CLOSED') {
-    return 'Ride Closed';
-  } else if (newStatus === 'REFURBISHMENT') {
-    return 'Ride Under Refurbishment';
-  }
+  if (newStatus === 'OPERATING') return 'Ride Back Up! 🎉';
+  if (newStatus === 'DOWN') return 'Ride Down ⚠️';
+  if (newStatus === 'CLOSED') return 'Ride Closed';
+  if (newStatus === 'REFURBISHMENT') return 'Ride Under Refurbishment';
   return 'Ride Status Changed';
 }
 
-/**
- * Schedule the next check using Cloud Tasks
- */
+// ============================================
+// SCHEDULING
+// ============================================
+
 async function scheduleNextCheck(delaySeconds) {
   if (!config.dynamicScheduling) {
     console.log('Dynamic scheduling disabled, skipping task creation');
@@ -259,9 +297,7 @@ async function scheduleNextCheck(delaySeconds) {
     httpRequest: {
       httpMethod: 'POST',
       url: `${config.serviceUrl}/check`,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
     },
     scheduleTime: {
       seconds: Math.floor(Date.now() / 1000) + delaySeconds,
@@ -276,18 +312,23 @@ async function scheduleNextCheck(delaySeconds) {
   }
 }
 
-/**
- * Process attractions and check for status changes
- */
+// ============================================
+// MAIN STATUS CHECK
+// ============================================
+
 async function checkStatusChanges() {
+  // Initialize cache on first run
+  await initializeStatusCache();
+
   if (config.parkIds.length === 0) {
     console.warn('No park IDs configured');
-    return { checked: 0, changes: 0, ridesDown: 0, notifications: null };
+    return { checked: 0, changes: 0, ridesDown: 0, firestoreWrites: 0, notifications: null };
   }
 
   let totalChecked = 0;
   let totalChanges = 0;
   let ridesDown = 0;
+  let firestoreWrites = 0;
   const statusChanges = [];
 
   for (const parkId of config.parkIds) {
@@ -310,9 +351,7 @@ async function checkStatusChanges() {
         const rideName = attraction.name;
         const currentStatus = attraction.status || 'UNKNOWN';
 
-        if (!shouldMonitorRide(rideName)) {
-          continue;
-        }
+        if (!shouldMonitorRide(rideName)) continue;
 
         totalChecked++;
 
@@ -320,9 +359,11 @@ async function checkStatusChanges() {
           ridesDown++;
         }
 
-        const previousData = await getPreviousStatus(rideId);
+        // Get previous status from cache (no Firestore read!)
+        const previousData = getPreviousStatus(rideId);
         const previousStatus = previousData?.status;
 
+        // Detect changes
         if (previousStatus && previousStatus !== currentStatus) {
           console.log(`Status change detected: ${rideName} (${previousStatus} → ${currentStatus})`);
           totalChanges++;
@@ -334,7 +375,9 @@ async function checkStatusChanges() {
           });
         }
 
-        await saveStatus(rideId, currentStatus, rideName);
+        // Save to cache + Firestore (only writes if changed)
+        const didWrite = await saveStatus(rideId, currentStatus, rideName);
+        if (didWrite) firestoreWrites++;
       }
     } catch (error) {
       console.error(`Error processing park ${parkId}:`, error.message);
@@ -369,19 +412,27 @@ async function checkStatusChanges() {
     }
   }
 
-  return { checked: totalChecked, changes: totalChanges, ridesDown, notifications: notificationResults };
+  return {
+    checked: totalChecked,
+    changes: totalChanges,
+    ridesDown,
+    firestoreWrites,
+    cacheSize: statusCache.size,
+    notifications: notificationResults,
+  };
 }
 
-// Express app
+// ============================================
+// EXPRESS APP
+// ============================================
+
 const app = express();
 app.use(express.json());
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Register device for push notifications
 app.post('/devices', async (req, res) => {
   const { token, platform, deviceName } = req.body;
 
@@ -402,24 +453,19 @@ app.post('/devices', async (req, res) => {
   }
 });
 
-// Unregister device
 app.delete('/devices/:token', async (req, res) => {
   const { token } = req.params;
 
   try {
     await unregisterDevice(token);
     console.log(`Device unregistered: ${token.slice(0, 20)}...`);
-    res.status(200).json({
-      success: true,
-      message: 'Device unregistered',
-    });
+    res.status(200).json({ success: true, message: 'Device unregistered' });
   } catch (error) {
     console.error('Error unregistering device:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// List registered devices
 app.get('/devices', async (req, res) => {
   try {
     const devices = await getDeviceTokens();
@@ -437,7 +483,6 @@ app.get('/devices', async (req, res) => {
   }
 });
 
-// Test push notification endpoint
 app.post('/test-push', async (req, res) => {
   const { title, body } = req.body;
 
@@ -447,17 +492,13 @@ app.post('/test-push', async (req, res) => {
       body || 'This is a test push notification from ride-watch',
       { type: 'test' }
     );
-    res.status(200).json({
-      success: true,
-      result,
-    });
+    res.status(200).json({ success: true, result });
   } catch (error) {
     console.error('Error sending test push:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Main check endpoint (triggered by Cloud Scheduler or Cloud Tasks)
 app.post('/check', async (req, res) => {
   console.log('Starting ride status check...');
   const startTime = Date.now();
@@ -466,36 +507,28 @@ app.post('/check', async (req, res) => {
     const result = await checkStatusChanges();
     const duration = Date.now() - startTime;
 
-    const nextInterval = result.ridesDown > 0
-      ? config.alertIntervalSec
-      : config.normalIntervalSec;
+    console.log(`Check complete: ${result.checked} rides, ${result.changes} changes, ${result.firestoreWrites} writes (${duration}ms)`);
 
-    console.log(`Check complete: ${result.checked} rides checked, ${result.changes} changes, ${result.ridesDown} down (${duration}ms)`);
-    console.log(`Next check in ${nextInterval}s (${result.ridesDown > 0 ? 'alert mode' : 'normal mode'})`);
-
-    await scheduleNextCheck(nextInterval);
+    await scheduleNextCheck(config.checkIntervalSec);
 
     res.status(200).json({
       success: true,
       ridesChecked: result.checked,
       statusChanges: result.changes,
       ridesDown: result.ridesDown,
+      firestoreWrites: result.firestoreWrites,
+      cacheSize: result.cacheSize,
       notifications: result.notifications,
-      nextCheckSec: nextInterval,
-      mode: result.ridesDown > 0 ? 'alert' : 'normal',
+      nextCheckSec: config.checkIntervalSec,
       durationMs: duration,
     });
   } catch (error) {
     console.error('Error during status check:', error);
-    await scheduleNextCheck(config.normalIntervalSec);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    await scheduleNextCheck(config.checkIntervalSec);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Also support GET for easy testing
 app.get('/check', async (req, res) => {
   console.log('Starting ride status check (GET)...');
   const startTime = Date.now();
@@ -504,52 +537,52 @@ app.get('/check', async (req, res) => {
     const result = await checkStatusChanges();
     const duration = Date.now() - startTime;
 
-    const nextInterval = result.ridesDown > 0
-      ? config.alertIntervalSec
-      : config.normalIntervalSec;
-
-    console.log(`Check complete: ${result.checked} rides checked, ${result.changes} changes, ${result.ridesDown} down (${duration}ms)`);
+    console.log(`Check complete: ${result.checked} rides, ${result.changes} changes, ${result.firestoreWrites} writes (${duration}ms)`);
 
     res.status(200).json({
       success: true,
       ridesChecked: result.checked,
       statusChanges: result.changes,
       ridesDown: result.ridesDown,
+      firestoreWrites: result.firestoreWrites,
+      cacheSize: result.cacheSize,
       notifications: result.notifications,
-      nextCheckSec: nextInterval,
-      mode: result.ridesDown > 0 ? 'alert' : 'normal',
+      nextCheckSec: config.checkIntervalSec,
       durationMs: duration,
       note: 'GET request - next check not auto-scheduled',
     });
   } catch (error) {
     console.error('Error during status check:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Endpoint to manually start the scheduling loop
 app.post('/start', async (req, res) => {
   console.log('Starting scheduling loop...');
 
   try {
     await scheduleNextCheck(1);
-    res.status(200).json({
-      success: true,
-      message: 'Scheduling loop started',
-    });
+    res.status(200).json({ success: true, message: 'Scheduling loop started' });
   } catch (error) {
     console.error('Error starting scheduling loop:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Root endpoint
+app.get('/cache', (req, res) => {
+  res.status(200).json({
+    statusCache: {
+      size: statusCache.size,
+      initialized: statusCacheInitialized,
+    },
+    deviceCache: {
+      count: deviceCache.tokens.length,
+      ageMs: Date.now() - deviceCache.loadedAt,
+      ttlMs: DEVICE_CACHE_TTL_MS,
+    },
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({
     name: 'ride-watch',
@@ -557,29 +590,30 @@ app.get('/', (req, res) => {
     endpoints: {
       '/health': 'Health check',
       '/check': 'Trigger status check (POST auto-schedules next, GET does not)',
-      '/start': 'Start the dynamic scheduling loop (POST)',
+      '/start': 'Start the scheduling loop (POST)',
       '/devices': 'Register (POST), unregister (DELETE), or list (GET) devices',
       '/test-push': 'Send a test push notification (POST)',
+      '/cache': 'View cache stats',
     },
     config: {
       parksMonitored: config.parkIds.length,
       watchedRides: config.watchedRides.length || 'all',
       pushEnabled: firebaseInitialized,
       dynamicScheduling: config.dynamicScheduling,
-      normalIntervalSec: config.normalIntervalSec,
-      alertIntervalSec: config.alertIntervalSec,
+      checkIntervalSec: config.checkIntervalSec,
+    },
+    cache: {
+      statusCacheSize: statusCache.size,
+      deviceCacheCount: deviceCache.tokens.length,
     },
   });
 });
 
-// Start server
 app.listen(config.port, () => {
   console.log(`ride-watch service listening on port ${config.port}`);
   console.log(`Monitoring ${config.parkIds.length} park(s)`);
   console.log(`Watching ${config.watchedRides.length || 'all'} ride(s)`);
   console.log(`Push notifications: ${firebaseInitialized ? 'enabled' : 'disabled'}`);
+  console.log(`Check interval: ${config.checkIntervalSec}s`);
   console.log(`Dynamic scheduling: ${config.dynamicScheduling ? 'enabled' : 'disabled'}`);
-  if (config.dynamicScheduling) {
-    console.log(`  Normal interval: ${config.normalIntervalSec}s, Alert interval: ${config.alertIntervalSec}s`);
-  }
 });
