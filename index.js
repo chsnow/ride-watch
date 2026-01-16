@@ -662,22 +662,6 @@ app.get('/devices', async (req, res) => {
   }
 });
 
-app.post('/test-push', async (req, res) => {
-  const { title, body } = req.body;
-
-  try {
-    const result = await sendPushNotification(
-      title || 'Test Notification',
-      body || 'This is a test push notification from ride-watch',
-      { type: 'test' }
-    );
-    res.status(200).json({ success: true, result });
-  } catch (error) {
-    console.error('Error sending test push:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.post('/check', async (req, res) => {
   const startTime = Date.now();
   const { startedAt } = req.body || {};
@@ -806,7 +790,6 @@ app.get('/', (req, res) => {
       '/check': 'Trigger status check (POST auto-schedules next, GET does not)',
       '/start': 'Start the scheduling loop (POST)',
       '/devices': 'Register (POST), unregister (DELETE), or list (GET) devices',
-      '/test-push': 'Send a test push notification (POST)',
       '/cache': 'View cache stats',
     },
     config: {
