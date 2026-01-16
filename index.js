@@ -22,6 +22,8 @@ const config = {
   // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
   bedtimeEnabled: process.env.BEDTIME_ENABLED !== 'false', // Enabled by default
+  // Scheduled shutdown
+  maxRuntimeHours: process.env.MAX_RUNTIME_HOURS ? parseFloat(process.env.MAX_RUNTIME_HOURS) : null,
 };
 
 // Initialize Firebase Admin (uses Application Default Credentials in Cloud Run)
@@ -377,7 +379,28 @@ function getNextCheckDelay(normalDelaySeconds) {
   };
 }
 
-async function scheduleNextCheck(delaySeconds) {
+/**
+ * Check if max runtime has been exceeded
+ * @param {string|null} startedAt - ISO timestamp when monitoring started
+ * @returns {{ exceeded: boolean, elapsed: number|null, max: number|null }}
+ */
+function checkMaxRuntime(startedAt) {
+  if (!config.maxRuntimeHours || !startedAt) {
+    return { exceeded: false, elapsed: null, max: null };
+  }
+
+  const startTime = new Date(startedAt).getTime();
+  const now = Date.now();
+  const elapsedHours = (now - startTime) / (1000 * 60 * 60);
+
+  return {
+    exceeded: elapsedHours >= config.maxRuntimeHours,
+    elapsed: elapsedHours,
+    max: config.maxRuntimeHours,
+  };
+}
+
+async function scheduleNextCheck(delaySeconds, startedAt = null) {
   if (!config.dynamicScheduling) {
     console.log('Dynamic scheduling disabled, skipping task creation');
     return { scheduled: false, reason: 'dynamic scheduling disabled' };
@@ -386,6 +409,20 @@ async function scheduleNextCheck(delaySeconds) {
   if (!config.projectId || !config.serviceUrl) {
     console.warn('Missing PROJECT_ID or SERVICE_URL, cannot schedule next check');
     return { scheduled: false, reason: 'missing config' };
+  }
+
+  // Check if max runtime has been exceeded
+  const runtimeCheck = checkMaxRuntime(startedAt);
+  if (runtimeCheck.exceeded) {
+    const elapsedStr = runtimeCheck.elapsed.toFixed(2);
+    console.log(`Max runtime exceeded (${elapsedStr}h >= ${runtimeCheck.max}h) - stopping scheduling`);
+    return {
+      scheduled: false,
+      reason: 'max runtime exceeded',
+      elapsed: runtimeCheck.elapsed,
+      max: runtimeCheck.max,
+      shutdown: true,
+    };
   }
 
   // Check for bedtime and adjust delay if needed
@@ -402,6 +439,7 @@ async function scheduleNextCheck(delaySeconds) {
       httpMethod: 'POST',
       url: `${config.serviceUrl}/check`,
       headers: { 'Content-Type': 'application/json' },
+      body: Buffer.from(JSON.stringify({ startedAt })).toString('base64'),
     },
     scheduleTime: {
       seconds: Math.floor(Date.now() / 1000) + nextCheck.delaySeconds,
@@ -624,11 +662,12 @@ app.post('/test-push', async (req, res) => {
 
 app.post('/check', async (req, res) => {
   const startTime = Date.now();
+  const { startedAt } = req.body || {};
 
   // Check if we're in bedtime mode - skip status check and schedule wake-up
   if (isBedtime()) {
     console.log(`Bedtime mode active (${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00 ${config.bedtimeTimezone})`);
-    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec);
+    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec, startedAt);
     const duration = Date.now() - startTime;
 
     return res.status(200).json({
@@ -637,6 +676,7 @@ app.post('/check', async (req, res) => {
       message: `Skipping check - bedtime mode (${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00)`,
       nextCheckSec: scheduleResult.delaySeconds,
       scheduleReason: scheduleResult.reason,
+      shutdown: scheduleResult.shutdown || false,
       durationMs: duration,
     });
   }
@@ -649,7 +689,7 @@ app.post('/check', async (req, res) => {
 
     console.log(`Check complete: ${result.checked} rides, ${result.changes} changes, ${result.firestoreWrites} writes (${duration}ms)`);
 
-    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec);
+    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec, startedAt);
 
     res.status(200).json({
       success: true,
@@ -662,11 +702,12 @@ app.post('/check', async (req, res) => {
       notifications: result.notifications,
       nextCheckSec: scheduleResult.delaySeconds || config.checkIntervalSec,
       scheduleReason: scheduleResult.reason,
+      shutdown: scheduleResult.shutdown || false,
       durationMs: duration,
     });
   } catch (error) {
     console.error('Error during status check:', error);
-    await scheduleNextCheck(config.checkIntervalSec);
+    await scheduleNextCheck(config.checkIntervalSec, startedAt);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -700,11 +741,24 @@ app.get('/check', async (req, res) => {
 });
 
 app.post('/start', async (req, res) => {
+  const startedAt = new Date().toISOString();
   console.log('Starting scheduling loop...');
+  if (config.maxRuntimeHours) {
+    console.log(`Max runtime: ${config.maxRuntimeHours} hours (will stop at ${new Date(Date.now() + config.maxRuntimeHours * 60 * 60 * 1000).toISOString()})`);
+  }
 
   try {
-    await scheduleNextCheck(1);
-    res.status(200).json({ success: true, message: 'Scheduling loop started' });
+    const scheduleResult = await scheduleNextCheck(1, startedAt);
+    res.status(200).json({
+      success: true,
+      message: 'Scheduling loop started',
+      startedAt,
+      maxRuntimeHours: config.maxRuntimeHours,
+      scheduledShutdownAt: config.maxRuntimeHours
+        ? new Date(Date.now() + config.maxRuntimeHours * 60 * 60 * 1000).toISOString()
+        : null,
+      nextCheck: scheduleResult,
+    });
   } catch (error) {
     console.error('Error starting scheduling loop:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -743,6 +797,7 @@ app.get('/', (req, res) => {
       pushEnabled: firebaseInitialized,
       dynamicScheduling: config.dynamicScheduling,
       checkIntervalSec: config.checkIntervalSec,
+      maxRuntimeHours: config.maxRuntimeHours,
     },
     bedtime: {
       enabled: config.bedtimeEnabled,
@@ -766,6 +821,9 @@ app.listen(config.port, () => {
   console.log(`Push notifications: ${firebaseInitialized ? 'enabled' : 'disabled'}`);
   console.log(`Check interval: ${config.checkIntervalSec}s`);
   console.log(`Dynamic scheduling: ${config.dynamicScheduling ? 'enabled' : 'disabled'}`);
+  if (config.maxRuntimeHours) {
+    console.log(`Max runtime: ${config.maxRuntimeHours} hours`);
+  }
   if (config.bedtimeEnabled) {
     console.log(`Bedtime: ${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00 ${config.bedtimeTimezone}`);
   } else {
