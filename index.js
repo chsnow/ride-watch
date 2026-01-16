@@ -15,8 +15,13 @@ const config = {
   serviceUrl: process.env.SERVICE_URL,
   // Intervals in seconds
   checkIntervalSec: parseInt(process.env.CHECK_INTERVAL_SEC || '30', 10),
+  // Bedtime config (pause polling during off-hours)
+  bedtimeStart: parseInt(process.env.BEDTIME_START || '1', 10), // Hour to start bedtime (0-23, default 1am)
+  bedtimeEnd: parseInt(process.env.BEDTIME_END || '7', 10),     // Hour to end bedtime (0-23, default 7am)
+  bedtimeTimezone: process.env.BEDTIME_TIMEZONE || 'America/New_York',
   // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
+  bedtimeEnabled: process.env.BEDTIME_ENABLED !== 'false', // Enabled by default
 };
 
 // Initialize Firebase Admin (uses Application Default Credentials in Cloud Run)
@@ -246,6 +251,80 @@ async function sendPushNotification(title, body, data = {}) {
 }
 
 // ============================================
+// BEDTIME LOGIC
+// ============================================
+
+/**
+ * Get current hour in the configured timezone
+ */
+function getCurrentHourInTimezone() {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.bedtimeTimezone,
+    hour: 'numeric',
+    hour12: false,
+  });
+  return parseInt(formatter.format(now), 10);
+}
+
+/**
+ * Check if we're currently in bedtime hours
+ */
+function isBedtime() {
+  if (!config.bedtimeEnabled) return false;
+
+  const currentHour = getCurrentHourInTimezone();
+  const { bedtimeStart, bedtimeEnd } = config;
+
+  // Handle overnight bedtime (e.g., 1am to 7am)
+  if (bedtimeStart < bedtimeEnd) {
+    return currentHour >= bedtimeStart && currentHour < bedtimeEnd;
+  }
+  // Handle cross-midnight bedtime (e.g., 11pm to 7am)
+  return currentHour >= bedtimeStart || currentHour < bedtimeEnd;
+}
+
+/**
+ * Calculate seconds until bedtime ends
+ */
+function getSecondsUntilBedtimeEnds() {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.bedtimeTimezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+
+  // Parse current time in the target timezone
+  const parts = formatter.formatToParts(now);
+  const getPart = (type) => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
+
+  const currentHour = getPart('hour');
+  const currentMinute = getPart('minute');
+  const currentSecond = getPart('second');
+
+  // Calculate seconds until bedtime end hour
+  let hoursUntilEnd;
+  if (currentHour < config.bedtimeEnd) {
+    hoursUntilEnd = config.bedtimeEnd - currentHour;
+  } else {
+    // We're past bedtime end, so it ends tomorrow
+    hoursUntilEnd = 24 - currentHour + config.bedtimeEnd;
+  }
+
+  // Convert to seconds, subtracting current minutes and seconds
+  const secondsUntilEnd = (hoursUntilEnd * 3600) - (currentMinute * 60) - currentSecond;
+
+  // Add a small buffer to ensure we're past the bedtime end
+  return Math.max(secondsUntilEnd + 60, 60);
+}
+
+// ============================================
 // HELPERS
 // ============================================
 
@@ -276,16 +355,41 @@ function getNotificationTitle(newStatus) {
 // SCHEDULING
 // ============================================
 
+/**
+ * Determine the delay for the next check, accounting for bedtime
+ * Returns { delaySeconds, reason }
+ */
+function getNextCheckDelay(normalDelaySeconds) {
+  if (isBedtime()) {
+    const delaySeconds = getSecondsUntilBedtimeEnds();
+    const hours = Math.floor(delaySeconds / 3600);
+    const minutes = Math.floor((delaySeconds % 3600) / 60);
+    return {
+      delaySeconds,
+      reason: `bedtime (sleeping for ${hours}h ${minutes}m until ${config.bedtimeEnd}:00)`,
+      isBedtime: true,
+    };
+  }
+  return {
+    delaySeconds: normalDelaySeconds,
+    reason: 'normal interval',
+    isBedtime: false,
+  };
+}
+
 async function scheduleNextCheck(delaySeconds) {
   if (!config.dynamicScheduling) {
     console.log('Dynamic scheduling disabled, skipping task creation');
-    return;
+    return { scheduled: false, reason: 'dynamic scheduling disabled' };
   }
 
   if (!config.projectId || !config.serviceUrl) {
     console.warn('Missing PROJECT_ID or SERVICE_URL, cannot schedule next check');
-    return;
+    return { scheduled: false, reason: 'missing config' };
   }
+
+  // Check for bedtime and adjust delay if needed
+  const nextCheck = getNextCheckDelay(delaySeconds);
 
   const queuePath = tasksClient.queuePath(
     config.projectId,
@@ -300,15 +404,22 @@ async function scheduleNextCheck(delaySeconds) {
       headers: { 'Content-Type': 'application/json' },
     },
     scheduleTime: {
-      seconds: Math.floor(Date.now() / 1000) + delaySeconds,
+      seconds: Math.floor(Date.now() / 1000) + nextCheck.delaySeconds,
     },
   };
 
   try {
     const [response] = await tasksClient.createTask({ parent: queuePath, task });
-    console.log(`Scheduled next check in ${delaySeconds}s: ${response.name}`);
+    console.log(`Scheduled next check in ${nextCheck.delaySeconds}s (${nextCheck.reason}): ${response.name}`);
+    return {
+      scheduled: true,
+      delaySeconds: nextCheck.delaySeconds,
+      reason: nextCheck.reason,
+      isBedtime: nextCheck.isBedtime,
+    };
   } catch (error) {
     console.error('Failed to schedule next check:', error.message);
+    return { scheduled: false, reason: error.message };
   }
 }
 
@@ -512,8 +623,25 @@ app.post('/test-push', async (req, res) => {
 });
 
 app.post('/check', async (req, res) => {
-  console.log('Starting ride status check...');
   const startTime = Date.now();
+
+  // Check if we're in bedtime mode - skip status check and schedule wake-up
+  if (isBedtime()) {
+    console.log(`Bedtime mode active (${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00 ${config.bedtimeTimezone})`);
+    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec);
+    const duration = Date.now() - startTime;
+
+    return res.status(200).json({
+      success: true,
+      bedtime: true,
+      message: `Skipping check - bedtime mode (${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00)`,
+      nextCheckSec: scheduleResult.delaySeconds,
+      scheduleReason: scheduleResult.reason,
+      durationMs: duration,
+    });
+  }
+
+  console.log('Starting ride status check...');
 
   try {
     const result = await checkStatusChanges();
@@ -521,17 +649,19 @@ app.post('/check', async (req, res) => {
 
     console.log(`Check complete: ${result.checked} rides, ${result.changes} changes, ${result.firestoreWrites} writes (${duration}ms)`);
 
-    await scheduleNextCheck(config.checkIntervalSec);
+    const scheduleResult = await scheduleNextCheck(config.checkIntervalSec);
 
     res.status(200).json({
       success: true,
+      bedtime: false,
       ridesChecked: result.checked,
       statusChanges: result.changes,
       ridesDown: result.ridesDown,
       firestoreWrites: result.firestoreWrites,
       cacheSize: result.cacheSize,
       notifications: result.notifications,
-      nextCheckSec: config.checkIntervalSec,
+      nextCheckSec: scheduleResult.delaySeconds || config.checkIntervalSec,
+      scheduleReason: scheduleResult.reason,
       durationMs: duration,
     });
   } catch (error) {
@@ -614,6 +744,14 @@ app.get('/', (req, res) => {
       dynamicScheduling: config.dynamicScheduling,
       checkIntervalSec: config.checkIntervalSec,
     },
+    bedtime: {
+      enabled: config.bedtimeEnabled,
+      start: `${config.bedtimeStart}:00`,
+      end: `${config.bedtimeEnd}:00`,
+      timezone: config.bedtimeTimezone,
+      currentlyActive: isBedtime(),
+      currentHour: getCurrentHourInTimezone(),
+    },
     cache: {
       statusCacheSize: statusCache.size,
       deviceCacheCount: deviceCache.tokens.length,
@@ -628,4 +766,9 @@ app.listen(config.port, () => {
   console.log(`Push notifications: ${firebaseInitialized ? 'enabled' : 'disabled'}`);
   console.log(`Check interval: ${config.checkIntervalSec}s`);
   console.log(`Dynamic scheduling: ${config.dynamicScheduling ? 'enabled' : 'disabled'}`);
+  if (config.bedtimeEnabled) {
+    console.log(`Bedtime: ${config.bedtimeStart}:00 - ${config.bedtimeEnd}:00 ${config.bedtimeTimezone}`);
+  } else {
+    console.log('Bedtime: disabled');
+  }
 });
