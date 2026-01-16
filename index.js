@@ -16,9 +16,9 @@ const config = {
   // Intervals in seconds
   checkIntervalSec: parseInt(process.env.CHECK_INTERVAL_SEC || '30', 10),
   // Bedtime config (pause polling during off-hours)
-  bedtimeStart: parseInt(process.env.BEDTIME_START || '1', 10), // Hour to start bedtime (0-23, default 1am)
-  bedtimeEnd: parseInt(process.env.BEDTIME_END || '7', 10),     // Hour to end bedtime (0-23, default 7am)
-  bedtimeTimezone: process.env.BEDTIME_TIMEZONE || 'America/New_York',
+  bedtimeStart: parseInt(process.env.BEDTIME_START || '23', 10), // Hour to start bedtime (0-23, default 11pm)
+  bedtimeEnd: parseInt(process.env.BEDTIME_END || '7', 10),      // Hour to end bedtime (0-23, default 7am)
+  bedtimeTimezone: process.env.BEDTIME_TIMEZONE || 'America/Los_Angeles',
   // Feature flags
   dynamicScheduling: process.env.DYNAMIC_SCHEDULING === 'true',
   bedtimeEnabled: process.env.BEDTIME_ENABLED !== 'false', // Enabled by default
