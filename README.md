@@ -9,7 +9,8 @@ A serverless service that monitors Disney theme park attraction status and sends
 - Runs on Google Cloud Run with Cloud Scheduler triggers
 - Persists state in Firestore between invocations
 - Filter to monitor only specific rides or all attractions
-- **Dynamic scheduling**: Checks every 5 minutes normally, every 1 minute when any ride is down
+- **In-memory caching**: Reduces Firestore costs by caching state and only writing on changes
+- **Dynamic scheduling**: Self-schedules checks via Cloud Tasks at configurable intervals
 
 ## Prerequisites
 
@@ -265,8 +266,7 @@ curl -X POST ${SERVICE_URL}/test-push \
 | `CLOUD_TASKS_LOCATION` | No | Cloud Tasks location (default: us-central1) |
 | `CLOUD_TASKS_QUEUE` | No | Cloud Tasks queue name (default: ride-watch-queue) |
 | `SERVICE_URL` | For dynamic | Cloud Run service URL (required for dynamic scheduling) |
-| `NORMAL_INTERVAL_SEC` | No | Check interval when all rides up (default: 300) |
-| `ALERT_INTERVAL_SEC` | No | Check interval when rides down (default: 60) |
+| `CHECK_INTERVAL_SEC` | No | Check interval in seconds (default: 30) |
 
 ## API Endpoints
 
@@ -281,6 +281,7 @@ curl -X POST ${SERVICE_URL}/test-push \
 | `/devices` | POST | Register device for push notifications |
 | `/devices/:token` | DELETE | Unregister a device |
 | `/test-push` | POST | Send a test push notification |
+| `/cache` | GET | View in-memory cache stats |
 
 ## Device Registration
 
