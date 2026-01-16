@@ -96,12 +96,17 @@ async function getDeviceTokens() {
  * Register a device token
  */
 async function registerDevice(token, metadata = {}) {
+  // Filter out undefined values
+  const cleanMetadata = Object.fromEntries(
+    Object.entries(metadata).filter(([_, v]) => v !== undefined)
+  );
+
   await devicesCollection.doc(token).set({
     active: true,
     registeredAt: new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
-    platform: metadata.platform || 'ios',
-    ...metadata,
+    platform: cleanMetadata.platform || 'ios',
+    ...cleanMetadata,
   }, { merge: true });
 }
 
