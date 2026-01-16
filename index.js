@@ -434,7 +434,14 @@ async function scheduleNextCheck(delaySeconds, startedAt = null) {
     config.queueName
   );
 
+  // Calculate scheduled time and create a deterministic task name
+  // Round to nearest interval to handle slight timing variations
+  const scheduledSeconds = Math.floor(Date.now() / 1000) + nextCheck.delaySeconds;
+  const roundedSeconds = Math.round(scheduledSeconds / config.checkIntervalSec) * config.checkIntervalSec;
+  const taskName = `${queuePath}/tasks/check-${roundedSeconds}`;
+
   const task = {
+    name: taskName,
     httpRequest: {
       httpMethod: 'POST',
       url: `${config.serviceUrl}/check`,
@@ -442,7 +449,7 @@ async function scheduleNextCheck(delaySeconds, startedAt = null) {
       body: Buffer.from(JSON.stringify({ startedAt })).toString('base64'),
     },
     scheduleTime: {
-      seconds: Math.floor(Date.now() / 1000) + nextCheck.delaySeconds,
+      seconds: scheduledSeconds,
     },
   };
 
@@ -456,6 +463,17 @@ async function scheduleNextCheck(delaySeconds, startedAt = null) {
       isBedtime: nextCheck.isBedtime,
     };
   } catch (error) {
+    // Error code 6 is ALREADY_EXISTS - task with this name already scheduled
+    if (error.code === 6) {
+      console.log(`Task already scheduled for ${roundedSeconds} (${nextCheck.reason}), skipping duplicate`);
+      return {
+        scheduled: true,
+        delaySeconds: nextCheck.delaySeconds,
+        reason: nextCheck.reason,
+        isBedtime: nextCheck.isBedtime,
+        deduplicated: true,
+      };
+    }
     console.error('Failed to schedule next check:', error.message);
     return { scheduled: false, reason: error.message };
   }
