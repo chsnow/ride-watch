@@ -330,6 +330,7 @@ async function checkStatusChanges() {
   let ridesDown = 0;
   let firestoreWrites = 0;
   const statusChanges = [];
+  const nonOperatingRides = [];
 
   for (const parkId of config.parkIds) {
     try {
@@ -357,6 +358,7 @@ async function checkStatusChanges() {
 
         if (isDownStatus(currentStatus)) {
           ridesDown++;
+          nonOperatingRides.push({ name: rideName, status: currentStatus });
         }
 
         // Get previous status from cache (no Firestore read!)
@@ -382,6 +384,16 @@ async function checkStatusChanges() {
     } catch (error) {
       console.error(`Error processing park ${parkId}:`, error.message);
     }
+  }
+
+  // Log non-operating rides
+  if (nonOperatingRides.length > 0) {
+    console.log(`Non-operating rides (${nonOperatingRides.length}):`);
+    for (const ride of nonOperatingRides) {
+      console.log(`  - ${ride.name}: ${ride.status}`);
+    }
+  } else {
+    console.log('All monitored rides are operating');
   }
 
   // Send push notifications for status changes
