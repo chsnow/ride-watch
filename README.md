@@ -12,6 +12,10 @@ A serverless service that monitors Disney theme park attraction status and sends
 - **In-memory caching**: Reduces Firestore costs by caching state and only writing on changes
 - **Dynamic scheduling**: Self-schedules checks via Cloud Tasks at configurable intervals
 
+## Client Apps
+
+- [Ride Tracker](https://github.com/chsnow/ridetracker) - iOS app for tracking Disneyland wait times and ride history
+
 ## Prerequisites
 
 - Node.js 20+
